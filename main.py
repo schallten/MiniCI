@@ -1,17 +1,18 @@
 from typing import *
 from datetime import datetime
 from enum import Enum
+from typing import Any, List
 import uuid
 from celery.states import SUCCESS
 from click import Option
-from fastapi import FastAPI, APIRouter, status
+from fastapi import FastAPI, APIRouter, HTTPException, status
 from pydantic import BaseModel
 import os
 from contextlib import asynccontextmanager
 from pydantic.mypy import from_attributes_callback
 from requests import session
 from sqlalchemy import Engine, create_engine, null
-from sqlalchemy.orm import Session, sessionmaker, declarative_base
+from sqlalchemy.orm import Query, Session, sessionmaker, declarative_base
 from sqlalchemy import String, DateTime, ForeignKey, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -105,7 +106,83 @@ class PipelineRun(Base):
     started_at:Optional[datetime]
     steps: List[PipelineStep]
 
-app = FastAPI()
+app = FastAPI(title="MiniCI API",version="0.0.1")
+
+@app.post("/projects", response_model=ProjectResponse, status_code=201)
+def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
+    db_project = Project(
+        id=str(uuid4()),
+        name=project.name,
+        repo_url=project.repo_url
+    )
+    db.add(db_project)
+    db.commit()
+    db.refresh(db_project)
+    return db_project
+
+@app.get(f"/projects/{project_id}",response_model=ProjectResponse)
+def get_project(project_id:str,db:Session=Depends(get_db)) -> Project:
+    project: Project | None=db.query(Project).filter(Project.id==project_id).first()
+    if not project:
+        raise HTTPException(status_code=404,detail="Project not found")
+    return project
+
+@app.get("/projects",response_model=List[ProjectResponse])
+def list_projects(db:Session=Depends(get_db)) -> List[Project]:
+    return db.query(Project).all()
+
+# run endpoints
+@app.post(
+    "/projects/{project_id}/runs",
+    response_model=RunResponse,
+    status_code=status.HTTP_202_ACCEPTED
+)
+def create_run(
+    project_id: str,
+    run_request: RunRequest,
+    db: Session = Depends(get_db)
+) -> PipelineRun:
+    # Verify project exists
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Create run
+    run_id = str(uuid4())
+    run = PipelineRun(
+        id=run_id,
+        project_id=project_id,
+        status="pending"
+    )
+    db.add(run)
+    
+    # Create steps
+    for i, command in enumerate(run_request.steps):
+        step = PipelineStep(
+            id=f"{run_id}-step-{i}",
+            run_id=run_id,
+            command=command
+        )
+        db.add(step)
+    
+    db.commit()
+    db.refresh(run)
+    
+    # TODO: queueue task
+    
+    return run
+
+@app.get(f"/runs/{run_id}",response_model=RunResponse)
+def get_run(run_id:str,db:Session=Depends(get_db)) -> PipelineRun:
+    run: PipelineRun | None=db.query(PipelineRun).filter(PipelineRun.id==run_id).first()
+    if not run:
+        raise HTTPException(status_code=404,detail="Run not found")
+    return run
+
+@app.get(f"/project/{project_id}/runs",response_model=List[RunResponse])
+def list_runs(project_id:str,db:Session=Depends(get_db)) -> List[PipelineRun]:
+    return db.query(PipelineRun).filter(PipelineRun.project_id==project_id).all()
+
 
 @app.get("/")
 def read_root() -> dict[str, str]:
