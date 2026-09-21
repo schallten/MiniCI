@@ -1,18 +1,14 @@
 from typing import *
 from datetime import datetime
 from enum import Enum
-from typing import Any, List
+from typing import Any, Generator, List, Optional
+from uuid import uuid4
 import uuid
-from celery.states import SUCCESS
-from click import Option
-from fastapi import FastAPI, APIRouter, HTTPException, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 import os
-from contextlib import asynccontextmanager
-from pydantic.mypy import from_attributes_callback
-from requests import session
-from sqlalchemy import Engine, create_engine, null
-from sqlalchemy.orm import Query, Session, sessionmaker, declarative_base
+from sqlalchemy import Engine, create_engine
+from sqlalchemy.orm import Session, sessionmaker, declarative_base
 from sqlalchemy import String, DateTime, ForeignKey, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -31,6 +27,12 @@ def get_db() -> Generator[Session, Any, None]:
 
 def generate_uuid()->str:
     return str(uuid.uuid4())
+
+class RunStatus(str,Enum):
+    PENDING="pending"
+    RUNNING="running"
+    SUCCESS="success"
+    FAILED="failed"
 
 class Project(Base):
     __tablename__: str="projects"
@@ -56,7 +58,7 @@ class PipelineRun(Base):
 
 class PipelineStep(Base):
     __tablename__:str="pipeline_steps"
-    id:Mapped[str]=mapped_column(String(36),primary_key=True,default=generate_uuid)
+    id:Mapped[str]=mapped_column(String(50),primary_key=True,default=generate_uuid)
     run_id:Mapped[str]=mapped_column(String(36),ForeignKey("pipeline_runs.id"))
     command:Mapped[str]=mapped_column(Text,nullable=False)
     stdout:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
@@ -64,12 +66,6 @@ class PipelineStep(Base):
     exit_code:Mapped[Optional[int]]=mapped_column(Integer,nullable=True)
 
     run:Mapped["PipelineRun"]=relationship(back_populates="steps")
-
-class RunStatus(str,Enum):
-    PENDING="pending"
-    RUNNING="running"
-    SUCCESS="success"
-    FAILED="failed"
 
 class ProjectCreate(BaseModel):
     name:str
@@ -89,6 +85,16 @@ class ProjectResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class StepResponse(BaseModel):
+    id: str
+    command: str
+    stdout: Optional[str]
+    stderr: Optional[str]
+    exit_code: Optional[int]
+
+    class Config:
+        from_attributes = True
+
 class RunResponse(BaseModel):
     id:str
     project_id:str
@@ -100,11 +106,7 @@ class RunResponse(BaseModel):
     class Config:
         from_attributes=True
 
-class PipelineRun(Base):
-    id:str
-    status:RunStatus
-    started_at:Optional[datetime]
-    steps: List[PipelineStep]
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="MiniCI API",version="0.0.1")
 
@@ -120,7 +122,7 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
     db.refresh(db_project)
     return db_project
 
-@app.get(f"/projects/{project_id}",response_model=ProjectResponse)
+@app.get("/projects/{project_id}",response_model=ProjectResponse)
 def get_project(project_id:str,db:Session=Depends(get_db)) -> Project:
     project: Project | None=db.query(Project).filter(Project.id==project_id).first()
     if not project:
@@ -172,14 +174,14 @@ def create_run(
     
     return run
 
-@app.get(f"/runs/{run_id}",response_model=RunResponse)
+@app.get("/runs/{run_id}",response_model=RunResponse)
 def get_run(run_id:str,db:Session=Depends(get_db)) -> PipelineRun:
     run: PipelineRun | None=db.query(PipelineRun).filter(PipelineRun.id==run_id).first()
     if not run:
         raise HTTPException(status_code=404,detail="Run not found")
     return run
 
-@app.get(f"/project/{project_id}/runs",response_model=List[RunResponse])
+@app.get("/project/{project_id}/runs",response_model=List[RunResponse])
 def list_runs(project_id:str,db:Session=Depends(get_db)) -> List[PipelineRun]:
     return db.query(PipelineRun).filter(PipelineRun.project_id==project_id).all()
 
