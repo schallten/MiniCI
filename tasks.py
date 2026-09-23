@@ -2,12 +2,15 @@ from celery import Celery
 from datetime import datetime
 from typing import Dict, Any, List
 import json
+import os
 import redis
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 celery_app = Celery(
     "minici",
-    broker="redis://localhost:6379/0",
-    backend="redis://localhost:6379/0"
+    broker=REDIS_URL,
+    backend=REDIS_URL,
 )
 
 celery_app.conf.update(
@@ -18,7 +21,7 @@ celery_app.conf.update(
     enable_utc=True,
 )
 
-redis_client = redis.Redis(host="localhost", port=6379, db=0)
+redis_client = redis.from_url(REDIS_URL)
 
 
 @celery_app.task(bind=True, name="execute_pipeline")
@@ -114,3 +117,4 @@ def execute_pipeline(
         return {"status": "error", "message": str(e)}
     finally:
         db.close()
+        runner.cleanup_workspace(run_id)

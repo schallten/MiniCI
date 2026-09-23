@@ -6,7 +6,7 @@ from uuid import uuid4
 import uuid
 from docker.models.containers import Container
 WaitContainerResponse = Dict[str, Any]
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import os
 from sqlalchemy import Engine, create_engine
@@ -15,11 +15,15 @@ from sqlalchemy import String, DateTime, ForeignKey, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import docker
 from docker.errors import ContainerError,ImageNotFound
-from typing import Tuple,List
+from typing import Tuple,List,Dict,Set
+import asyncio
 
-from tasks import execute_pipeline
+from tasks import execute_pipeline, redis_client
 
-DATABASE_URL="postgresql+psycopg2://user:password@localhost:5432/myapp"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://user:password@localhost:5432/myapp",
+)
 
 engine: Engine = create_engine(DATABASE_URL)
 SessionLocal: sessionmaker[Session] = sessionmaker(autocommit=False,autoflush=False,bind=engine)
@@ -188,7 +192,7 @@ def get_run(run_id:str,db:Session=Depends(get_db)) -> PipelineRun:
         raise HTTPException(status_code=404,detail="Run not found")
     return run
 
-@app.get("/project/{project_id}/runs",response_model=List[RunResponse])
+@app.get("/projects/{project_id}/runs",response_model=List[RunResponse])
 def list_runs(project_id:str,db:Session=Depends(get_db)) -> List[PipelineRun]:
     return db.query(PipelineRun).filter(PipelineRun.project_id==project_id).all()
 
@@ -199,17 +203,26 @@ class DockerRunner:
         self.client: docker.DockerClient = docker.from_env()
         self.image:str = "python:3.11-slim"
 
+    def _volume_name(self, run_id: str) -> str:
+        return f"minici-ws-{run_id}"
+
+    def cleanup_workspace(self, run_id: str) -> None:
+        """Remove shared workspace volume for a run."""
+        try:
+            vol = self.client.volumes.get(self._volume_name(run_id))
+            vol.remove(force=True)
+        except Exception:
+            pass
+
     def run_steps(
             self,
             steps:List[str],
             run_id:str,
             timeout:int=300
     )->Tuple[bool,str]:
-        """execute steps in docker container"""
-        """returns :
-            tupe of (success:bool , combined_output:str)
-        """
+        """execute steps in docker container (shared workspace per run)"""
         combined_output = []
+        volume = self._volume_name(run_id)
         for i,step in enumerate(steps):
             try:
                 container: Container=self.client.containers.run(
@@ -222,6 +235,8 @@ class DockerRunner:
                     network_disabled=True, # no network accesss
                     remove=False,
                     working_dir="/workspace",
+                    # shared across steps of the same run (CI-style workspace)
+                    volumes={volume: {"bind": "/workspace", "mode": "rw"}},
                 )
 
                 # waith with timeout
@@ -241,6 +256,51 @@ class DockerRunner:
 
         return True, "\n".join(combined_output)
 
+class ConnectionManager:
+    """manage websocket connections for run logs"""
+    def __init__(self) -> None:
+        self.active_connections:Dict[str,Set[WebSocket]]={}
+
+    async def connect(self,websocket:WebSocket,run_id:str)-> None:
+        await websocket.accept()
+        if run_id not in self.active_connections:
+            self.active_connections[run_id]=set()
+        self.active_connections[run_id].add(websocket)
+
+    def disconnect(self,websocket:WebSocket,run_id:str)->None:
+        if run_id in self.active_connections:
+            self.active_connections[run_id].discard(websocket)
+
+    async def broadcast(self,run_id:str,message:str)->None:
+        if run_id in self.active_connections:
+            for connection in list(self.active_connections[run_id]):
+                await connection.send_text(message)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/runs/{run_id}")
+async def websocket_logs(websocket:WebSocket,run_id:str)->None:
+    """stream logs for specific run"""
+    await manager.connect(websocket,run_id)
+
+    pubsub = redis_client.pubsub()
+    await asyncio.to_thread(pubsub.subscribe, f"logs:{run_id}")
+
+    try:
+        while True:
+            message = await asyncio.to_thread(pubsub.get_message, timeout=1.0)
+            if message and message["type"]=="message":
+                data = message["data"]
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                await websocket.send_text(data)
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        manager.disconnect(websocket,run_id)
+        await asyncio.to_thread(pubsub.unsubscribe, f"logs:{run_id}")
+        pubsub.close()
 
 @app.get("/")
 def read_root() -> dict[str, str]:
