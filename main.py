@@ -4,7 +4,6 @@ from enum import Enum
 from typing import Any, Generator, List, Optional
 from uuid import uuid4
 import uuid
-from celery.states import SUCCESS
 from docker.models.containers import Container
 WaitContainerResponse = Dict[str, Any]
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
@@ -17,6 +16,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 import docker
 from docker.errors import ContainerError,ImageNotFound
 from typing import Tuple,List
+
+from tasks import execute_pipeline
 
 DATABASE_URL="postgresql+psycopg2://user:password@localhost:5432/myapp"
 
@@ -176,7 +177,7 @@ def create_run(
     db.commit()
     db.refresh(run)
     
-    # TODO: queueue task
+    execute_pipeline.delay(run_id, run_request.steps)
     
     return run
 
@@ -240,15 +241,6 @@ class DockerRunner:
 
         return True, "\n".join(combined_output)
 
-# # test docker
-# runner = DockerRunner()
-# success,output = runner.run_steps(
-#     steps=["echo 'hello from docker'","python3 -c 'print(2+2)'"],
-#     run_id="test-001"
-# )
-
-# print(f"Success: {success}")
-# print(f"Output: {output}")
 
 @app.get("/")
 def read_root() -> dict[str, str]:
