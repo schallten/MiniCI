@@ -4,6 +4,9 @@ from enum import Enum
 from typing import Any, Generator, List, Optional
 from uuid import uuid4
 import uuid
+from celery.states import SUCCESS
+from docker.models.containers import Container
+WaitContainerResponse = Dict[str, Any]
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 import os
@@ -11,6 +14,9 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker, declarative_base
 from sqlalchemy import String, DateTime, ForeignKey, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+import docker
+from docker.errors import ContainerError,ImageNotFound
+from typing import Tuple,List
 
 DATABASE_URL="postgresql+psycopg2://user:password@localhost:5432/myapp"
 
@@ -185,6 +191,64 @@ def get_run(run_id:str,db:Session=Depends(get_db)) -> PipelineRun:
 def list_runs(project_id:str,db:Session=Depends(get_db)) -> List[PipelineRun]:
     return db.query(PipelineRun).filter(PipelineRun.project_id==project_id).all()
 
+
+class DockerRunner:
+    """Execute pipeline steps in isolated docker containers"""
+    def __init__(self)->None:
+        self.client: docker.DockerClient = docker.from_env()
+        self.image:str = "python:3.11-slim"
+
+    def run_steps(
+            self,
+            steps:List[str],
+            run_id:str,
+            timeout:int=300
+    )->Tuple[bool,str]:
+        """execute steps in docker container"""
+        """returns :
+            tupe of (success:bool , combined_output:str)
+        """
+        combined_output = []
+        for i,step in enumerate(steps):
+            try:
+                container: Container=self.client.containers.run(
+                    image=self.image,
+                    command=["/bin/bash", "-c", step],
+                    detach=True,
+                    # resource limits
+                    nano_cpus=1_000_000_000, #1 cpu core
+                    mem_limit="512m",
+                    network_disabled=True, # no network accesss
+                    remove=False,
+                    working_dir="/workspace",
+                )
+
+                # waith with timeout
+                result: WaitContainerResponse = container.wait(timeout=timeout)
+                stdout: str=container.logs().decode("utf-8")
+
+                #cleanup
+                container.remove(force=True)
+
+                if result["StatusCode"]!=0:
+                    return False,f"Step {i+1} failed: {stdout}"
+
+                combined_output.append(stdout)
+
+            except Exception as e:
+                return False, f"Step {i+1} error: {str(e)}"
+
+        return True, "\n".join(combined_output)
+
+# # test docker
+# runner = DockerRunner()
+# success,output = runner.run_steps(
+#     steps=["echo 'hello from docker'","python3 -c 'print(2+2)'"],
+#     run_id="test-001"
+# )
+
+# print(f"Success: {success}")
+# print(f"Output: {output}")
 
 @app.get("/")
 def read_root() -> dict[str, str]:
